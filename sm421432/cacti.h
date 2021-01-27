@@ -48,6 +48,7 @@ int send_message(actor_id_t actor, message_t message);
 
 #endif
 
+// TODO
 // Idea
 // Queue for actors with and without messages
 // Threads pick actors with messages and execute them until they run out (solve starvation problem)
