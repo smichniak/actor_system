@@ -24,10 +24,13 @@
 typedef struct message_queue {
     actor_id_t first_index;
     actor_id_t second_index;
+    actor_id_t max_size;
     message_t* messages;
 } message_queue_t;
 
 typedef struct actor {
+    role_t* role;
+    void** stateptr;
     pthread_mutex_t actor_mutex;
     actor_id_t actor_id;
     bool is_dead;
@@ -49,7 +52,8 @@ typedef struct actor_system {
     actor_id_t how_many_actors;
     actor_id_t dead_actors;
 
-    actor_t* actors;
+    actor_t** actors;
+    actor_id_t actor_array_size;
 
     actor_queue_t actors_with_messages;
 
@@ -70,6 +74,73 @@ void unlock(pthread_mutex_t* mutex) {
     if ((err = pthread_mutex_unlock(mutex)) != 0) {
         syserr(err, "Unlock failed");
     }
+}
+
+int resize_message_queue(message_queue_t* message_queue) {
+    if (message_queue->max_size == ACTOR_QUEUE_LIMIT) {
+        return -1;
+    }
+    actor_id_t old_size = message_queue->max_size;
+
+    if (message_queue->max_size * 2 > ACTOR_QUEUE_LIMIT) {
+        message_queue->max_size = ACTOR_QUEUE_LIMIT;
+    } else {
+        message_queue->max_size *= 2;
+    }
+
+    message_queue->messages = realloc(message_queue->messages, message_queue->max_size);
+    if (!message_queue->messages) {
+        printf("Memory error"); // todo handle
+        return -1;
+    }
+
+
+    // todo does not work if new_size < 2 * old_size
+    if (message_queue->first_index > message_queue->second_index) {
+        for (int i = 0; i < message_queue->first_index; ++i) {
+            message_queue->messages[i + old_size] = message_queue->messages[i];
+        }
+        message_queue->second_index = message_queue->second_index + old_size;
+    }
+    return 0;
+
+}
+
+int add_message_to_queue(message_queue_t* message_queue, message_t message) { // We have locked mutex for actor here
+    if ((message_queue->second_index + 1) % message_queue->max_size ==
+            message_queue->first_index) { // No empty spaces in queue
+
+        if (resize_message_queue(message_queue) != 0) {
+            return -1;
+        }
+    }
+
+    message_queue->messages[message_queue->second_index] = message;
+    message_queue->second_index = (message_queue->second_index + 1) % message_queue->max_size;
+    return 0;
+}
+
+int send_message(actor_id_t actor, message_t message) {
+    lock(&actor_system_data.variables_mutex);
+
+    if (actor < 1 || actor > actor_system_data.how_many_actors) {
+        unlock(&actor_system_data.variables_mutex);
+        return -2;
+    }
+
+    actor_t* actor_ptr = actor_system_data.actors[actor];
+    lock(&actor_ptr->actor_mutex);
+
+    if (actor_ptr->is_dead) {
+        unlock(&actor_ptr->actor_mutex);
+        return -1;
+    }
+
+    int result = add_message_to_queue(&actor_ptr->message_queue, message);
+
+    unlock(&actor_ptr->actor_mutex);
+    unlock(&actor_system_data.variables_mutex);
+    return result;
 }
 
 bool system_alive() {
@@ -110,6 +181,62 @@ void add_actor_to_queue(actor_queue_t* actor_queue, actor_t* actor_ptr) { // We 
 
 }
 
+void resize_actor_array() {
+    if (actor_system_data.actor_array_size * 2 > CAST_LIMIT + 1) { // +1 because we index actors from 1
+        actor_system_data.actor_array_size = CAST_LIMIT + 1;
+    } else {
+        actor_system_data.actor_array_size *= 2;
+    }
+    actor_system_data.actors = realloc(actor_system_data.actors, actor_system_data.actor_array_size);
+    if (!actor_system_data.actors) {
+        printf("Memory error"); // todo handle, syserr probably
+        return;
+    }
+
+}
+
+actor_t* create_actor(role_t* role) {
+    lock(&actor_system_data.variables_mutex);
+
+    if (actor_system_data.how_many_actors + 1 > CAST_LIMIT) {
+        //todo too many actors
+    }
+    if (actor_system_data.how_many_actors + 1 == actor_system_data.actor_array_size) {
+        resize_actor_array();
+    }
+
+    actor_t* actor = malloc(sizeof(actor_t));
+    if (actor == NULL) { // todo change to !actor
+        // todo syserr
+    }
+
+    actor->message_queue.messages = malloc(sizeof(message_t) * INITIAL_MESSAGE_QUEUE_LIMIT);
+    if (actor->message_queue.messages == NULL) {
+        // todo syserr
+    }
+
+    if (pthread_mutex_init(&actor->actor_mutex, 0) != 0) {
+        // todo syserr
+    }
+
+    actor->message_queue.first_index = 0;
+    actor->message_queue.second_index = 0;
+    actor->message_queue.max_size = INITIAL_MESSAGE_QUEUE_LIMIT;
+
+    actor->is_dead = false;
+
+    actor_system_data.how_many_actors++;
+
+    actor->actor_id = actor_system_data.how_many_actors;
+    actor_system_data.actors[actor_system_data.how_many_actors] = actor;
+    actor->role = role;
+    actor->stateptr = NULL;
+
+    unlock(&actor_system_data.variables_mutex);
+
+    return actor;
+}
+
 actor_id_t actor_id_self() {
     actor_id_t* actor_id_ptr = pthread_getspecific(actor_id_key);
     if (!actor_id_ptr) {
@@ -118,9 +245,54 @@ actor_id_t actor_id_self() {
     return *actor_id_ptr;
 }
 
+message_t get_message(actor_t* actor_ptr) {
+    lock(&actor_ptr->actor_mutex);
+    message_t message = actor_ptr->message_queue.messages[actor_ptr->message_queue.first_index];
+    actor_ptr->message_queue.first_index =
+            (actor_ptr->message_queue.first_index + 1) % actor_ptr->message_queue.max_size;
+
+    unlock(&actor_ptr->actor_mutex);
+
+    return message;
+}
+
+void handle_godie(actor_t* actor_ptr) {
+    lock(&actor_ptr->actor_mutex);
+
+    actor_ptr->is_dead = true;
+
+    unlock(&actor_ptr->actor_mutex);
+}
+
+void handle_spawn(actor_t* actor_ptr, message_t message) {
+    role_t* role = (role_t*) message.data;
+
+    actor_t* new_actor = create_actor(role);
+    message_t new_message;
+
+    new_message.message_type = MSG_HELLO;
+    new_message.data = (void*) actor_ptr->actor_id; //todo address or value?;
+    new_message.nbytes = sizeof(actor_id_t);
+
+    send_message(new_actor->actor_id, new_message);
+}
+
 void handle_actor(actor_t* actor_ptr) {
     pthread_setspecific(actor_id_key, &actor_ptr->actor_id);
-    
+
+    message_t message = get_message(actor_ptr);
+
+    if (message.message_type == MSG_GODIE) {
+        handle_godie(actor_ptr);
+    } else if (message.message_type == MSG_SPAWN) {
+        handle_spawn(actor_ptr, message);
+    } else {
+        role_t* role = actor_ptr->role;
+        act_t* prompts = role->prompts;
+        prompts[message.message_type](actor_ptr->stateptr, message.nbytes, message.data);
+
+    }
+
 
 }
 
@@ -159,7 +331,11 @@ void* thread_run() {
 
         if (actor_to_handle->message_queue.first_index != actor_to_handle->message_queue.second_index) {
             add_actor_to_queue(&actor_system_data.actors_with_messages, actor_to_handle);
+            actor_system_data.messages_to_handle = true;
         } else if (actor_to_handle->is_dead) {
+            if (actor_system_data.dead_actors == -1) {
+                actor_system_data.dead_actors = 0;
+            }
             actor_system_data.dead_actors++;
         }
 
@@ -171,21 +347,29 @@ void* thread_run() {
     return NULL; // TODO good function type?
 }
 
-void initialize_queue(actor_queue_t* queue) {
+int initialize_queue(actor_queue_t* queue) {
     queue->first_index = 0;
     queue->second_index = 0;
-    queue->max_size = INITIAL_MESSAGE_QUEUE_LIMIT;
-    queue->actors = malloc(sizeof(actor_t*) * INITIAL_MESSAGE_QUEUE_LIMIT);
+    queue->max_size = INITIAL_ACTOR_QUEUE_LIMIT;
+    queue->actors = malloc(sizeof(actor_t*) * INITIAL_ACTOR_QUEUE_LIMIT);
+    if (!queue->actors) {
+        return -1;
+    }
+    return 0;
 }
 
-void initialize_system_data() {
+int initialize_system_data() {
     actor_system_data.messages_to_handle = false;
-    actor_system_data.how_many_actors = 1;
-    actor_system_data.dead_actors = 0;
+    actor_system_data.how_many_actors = 0;
+    actor_system_data.dead_actors = -2;
 
-    actor_system_data.actors = malloc(sizeof(actor_t) * INITIAL_ACTOR_QUEUE_LIMIT);
+    actor_system_data.actors = malloc(sizeof(actor_t*) * INITIAL_ACTOR_QUEUE_LIMIT);
+    if (!actor_system_data.actors) {
+        return -1;
+    }
+    actor_system_data.actor_array_size = INITIAL_ACTOR_QUEUE_LIMIT;
 
-    initialize_queue(&actor_system_data.actors_with_messages);
+    return initialize_queue(&actor_system_data.actors_with_messages);
 }
 
 int actor_system_create(actor_id_t* actor, role_t* const role) {
@@ -202,9 +386,6 @@ int actor_system_create(actor_id_t* actor, role_t* const role) {
         Restore the thread’s signal mask, to the set that was saved in the first step
      */
 
-//    if (pthread_mutex_init(&actor_system_data.thread_mutex, 0) != 0) {
-//        return -1;
-//    }
 
     pthread_key_create(&actor_id_key, NULL);
 
@@ -216,19 +397,37 @@ int actor_system_create(actor_id_t* actor, role_t* const role) {
         return -1;
     }
 
-    initialize_system_data();
-
-    // todo handle memory leak if return -1
+    if (initialize_system_data() < 1) {
+        // todo cleanup memory
+        return -1;
+    }
 
     for (int i = 0; i <= POOL_SIZE - 1; ++i) {
 //        pthread_attr_t attr; // todo necessary?
         if (pthread_create(&actor_system_data.thread_array[i], NULL, thread_run, NULL) != 0) {
-            return -1; // todo memory
+            return -1; // todo memory cleanup
         }
     }
-    // todo send message to first actor
+    actor_t* first_actor = create_actor(role);
+    actor = &first_actor->actor_id;
 
-    // todo set actor to actor id
+    message_t new_message;
+    new_message.message_type = MSG_HELLO;
+    new_message.data = NULL;
+    new_message.nbytes = sizeof(actor_id_t);
+    send_message(*actor, new_message);
 
     return 0;
+}
+
+void actor_system_join(actor_id_t actor) {
+    lock(&actor_system_data.variables_mutex);
+
+
+
+
+
+    //todo cleanup memory
+
+
 }
