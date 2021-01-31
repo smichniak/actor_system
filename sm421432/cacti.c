@@ -10,10 +10,7 @@
 #include <errno.h>
 #include <unistd.h>
 
-#include "err.h"
-
 // TODO Optimize includes
-// TODO make functions static, so they are not visible
 
 
 #include "cacti.h"
@@ -30,10 +27,13 @@ typedef struct message_queue {
 
 typedef struct actor {
     role_t* role;
-    void** stateptr;
+    void* stateptr;
     pthread_mutex_t actor_mutex;
     actor_id_t actor_id;
     bool is_dead;
+    bool is_being_handled;
+    bool is_in_queue;
+    bool counted_as_dead;
     message_queue_t message_queue;
 } actor_t;
 
@@ -41,42 +41,51 @@ typedef struct actor_queue {
     actor_id_t first_index;
     actor_id_t second_index;
     actor_id_t max_size;
-    actor_t** actors;
+    actor_id_t* actors;
 } actor_queue_t;
 
 typedef struct actor_system {
     pthread_mutex_t variables_mutex;
     pthread_cond_t waiting_threads;
     pthread_t thread_array[POOL_SIZE];
-    bool messages_to_handle;
+    pthread_t signal_handler;
+
     actor_id_t how_many_actors;
     actor_id_t dead_actors;
+    bool can_create_new_actors;
 
     actor_t** actors;
     actor_id_t actor_array_size;
 
     actor_queue_t actors_with_messages;
-
 } actor_system_t;
 
-actor_system_t actor_system_data; // Global data structure for actor system
-pthread_key_t actor_id_key; // Global thread specific key for storing actor that is currently being handled
+actor_system_t actor_system_data = { // Global data structure for actor system
+        .variables_mutex = PTHREAD_MUTEX_INITIALIZER,
+        .waiting_threads = PTHREAD_COND_INITIALIZER,
+        .actors = NULL,
+        .actors_with_messages.actors = NULL,
+        .how_many_actors = 0,
+        .dead_actors = 0
+};
 
-void lock(pthread_mutex_t* mutex) {
+actor_id_t _Thread_local actor_id_thread; // Thread specific variable with id of actor being handled
+
+static inline void lock(pthread_mutex_t* mutex) {
     int err;
     if ((err = pthread_mutex_lock(mutex)) != 0) {
-        syserr(err, "Lock failed");
+        exit(1); // todo change tp syserr
     }
 }
 
-void unlock(pthread_mutex_t* mutex) {
+static inline void unlock(pthread_mutex_t* mutex) {
     int err;
     if ((err = pthread_mutex_unlock(mutex)) != 0) {
-        syserr(err, "Unlock failed");
+        exit(1); // todo change tp syserr
     }
 }
 
-int resize_message_queue(message_queue_t* message_queue) {
+static int resize_message_queue(message_queue_t* message_queue) {
     if (message_queue->max_size == ACTOR_QUEUE_LIMIT) {
         return -1;
     }
@@ -106,58 +115,11 @@ int resize_message_queue(message_queue_t* message_queue) {
 
 }
 
-int add_message_to_queue(message_queue_t* message_queue, message_t message) { // We have locked mutex for actor here
-    if ((message_queue->second_index + 1) % message_queue->max_size ==
-            message_queue->first_index) { // No empty spaces in queue
-
-        if (resize_message_queue(message_queue) != 0) {
-            return -1;
-        }
-    }
-
-    message_queue->messages[message_queue->second_index] = message;
-    message_queue->second_index = (message_queue->second_index + 1) % message_queue->max_size;
-    return 0;
-}
-
-int send_message(actor_id_t actor, message_t message) {
-    lock(&actor_system_data.variables_mutex);
-
-    if (actor < 1 || actor > actor_system_data.how_many_actors) {
-        unlock(&actor_system_data.variables_mutex);
-        return -2;
-    }
-
-    actor_t* actor_ptr = actor_system_data.actors[actor];
-    lock(&actor_ptr->actor_mutex);
-
-    if (actor_ptr->is_dead) {
-        unlock(&actor_ptr->actor_mutex);
-        return -1;
-    }
-
-    int result = add_message_to_queue(&actor_ptr->message_queue, message);
-
-    unlock(&actor_ptr->actor_mutex);
-    unlock(&actor_system_data.variables_mutex);
-    return result;
-}
-
-bool system_alive() {
-    lock(&actor_system_data.variables_mutex);
-
-    bool result = actor_system_data.how_many_actors == actor_system_data.dead_actors;
-
-    unlock(&actor_system_data.variables_mutex);
-
-    return result;
-}
-
-void resize_actor_queue(actor_queue_t* actor_queue) {
+static void resize_actor_queue(actor_queue_t* actor_queue) {
     actor_queue->max_size = actor_queue->max_size * 2;
     actor_queue->actors = realloc(actor_queue->actors, actor_queue->max_size);
     if (!actor_queue->actors) {
-        printf("Memory error"); // todo handle, syserr probably
+        printf("Memory error"); // todo change tp syserr
         return;
     }
 
@@ -170,18 +132,90 @@ void resize_actor_queue(actor_queue_t* actor_queue) {
 
 }
 
-void add_actor_to_queue(actor_queue_t* actor_queue, actor_t* actor_ptr) { // We have locked mutex for this queue
+static void add_actor_to_queue(actor_queue_t* actor_queue, actor_t* actor_ptr) {
+    lock(&actor_ptr->actor_mutex);
+    if (actor_ptr->is_being_handled || actor_ptr->is_in_queue) {
+        unlock(&actor_ptr->actor_mutex);
+        return;
+    } else {
+        actor_ptr->is_in_queue = true;
+    }
+    unlock(&actor_ptr->actor_mutex);
+
+    lock(&actor_system_data.variables_mutex);
     if ((actor_queue->second_index + 1) % actor_queue->max_size ==
         actor_queue->first_index) { // No empty spaces in queue
         resize_actor_queue(actor_queue);
     }
 
-    actor_queue->actors[actor_queue->second_index] = actor_ptr;
+    actor_queue->actors[actor_queue->second_index] = actor_ptr->actor_id; // Can access id without mutex
     actor_queue->second_index = (actor_queue->second_index + 1) % actor_queue->max_size;
 
+
+    // Wake up a thread that can handle the new message
+    if (pthread_cond_signal(&actor_system_data.waiting_threads) != 0) {
+        exit(1); // todo change tp syserr
+    }
+    unlock(&actor_system_data.variables_mutex);
 }
 
-void resize_actor_array() {
+static int add_message_to_queue(message_queue_t* message_queue, message_t message) {
+    // We have locked mutex for actor here
+
+    if ((message_queue->second_index + 1) % message_queue->max_size == message_queue->first_index) {
+        // No empty spaces in queue
+        if (resize_message_queue(message_queue) != 0) {
+            return -1;
+        }
+    }
+
+    message_queue->messages[message_queue->second_index] = message;
+    message_queue->second_index = (message_queue->second_index + 1) % message_queue->max_size;
+
+    return 0;
+}
+
+// Returns -3 if actor queue is full
+int send_message(actor_id_t actor, message_t message) {
+    lock(&actor_system_data.variables_mutex);
+
+    if (actor < 1 || actor > actor_system_data.how_many_actors) {
+        unlock(&actor_system_data.variables_mutex);
+        return -2;
+    }
+
+    actor_t* actor_ptr = actor_system_data.actors[actor];
+    unlock(&actor_system_data.variables_mutex);
+
+    lock(&actor_ptr->actor_mutex);
+
+    if (actor_ptr->is_dead) {
+        unlock(&actor_ptr->actor_mutex);
+        return -1;
+    }
+
+    if (add_message_to_queue(&actor_ptr->message_queue, message) != 0) {
+        unlock(&actor_ptr->actor_mutex);
+        return -3;
+    }
+
+    unlock(&actor_ptr->actor_mutex);
+    add_actor_to_queue(&actor_system_data.actors_with_messages, actor_ptr);
+
+    return 0;
+}
+
+static bool system_alive() {
+    lock(&actor_system_data.variables_mutex);
+
+    bool result = actor_system_data.how_many_actors != actor_system_data.dead_actors;
+
+    unlock(&actor_system_data.variables_mutex);
+
+    return result;
+}
+
+static void resize_actor_array() {
     if (actor_system_data.actor_array_size * 2 > CAST_LIMIT + 1) { // +1 because we index actors from 1
         actor_system_data.actor_array_size = CAST_LIMIT + 1;
     } else {
@@ -189,14 +223,19 @@ void resize_actor_array() {
     }
     actor_system_data.actors = realloc(actor_system_data.actors, actor_system_data.actor_array_size);
     if (!actor_system_data.actors) {
-        printf("Memory error"); // todo handle, syserr probably
+        printf("Memory error"); // todo change tp syserr
         return;
     }
 
 }
 
-actor_t* create_actor(role_t* role) {
+static actor_t* create_actor(role_t* role) {
     lock(&actor_system_data.variables_mutex);
+
+    if (!actor_system_data.can_create_new_actors) {
+        unlock(&actor_system_data.variables_mutex);
+        return NULL;
+    }
 
     if (actor_system_data.how_many_actors + 1 > CAST_LIMIT) {
         //todo too many actors
@@ -206,7 +245,7 @@ actor_t* create_actor(role_t* role) {
     }
 
     actor_t* actor = malloc(sizeof(actor_t));
-    if (actor == NULL) { // todo change to !actor
+    if (!actor) {
         // todo syserr
     }
 
@@ -224,6 +263,9 @@ actor_t* create_actor(role_t* role) {
     actor->message_queue.max_size = INITIAL_MESSAGE_QUEUE_LIMIT;
 
     actor->is_dead = false;
+    actor->is_being_handled = false;
+    actor->is_in_queue = false;
+    actor->counted_as_dead = false;
 
     actor_system_data.how_many_actors++;
 
@@ -233,19 +275,14 @@ actor_t* create_actor(role_t* role) {
     actor->stateptr = NULL;
 
     unlock(&actor_system_data.variables_mutex);
-
     return actor;
 }
 
 actor_id_t actor_id_self() {
-    actor_id_t* actor_id_ptr = pthread_getspecific(actor_id_key);
-    if (!actor_id_ptr) {
-        // todo error
-    }
-    return *actor_id_ptr;
+    return actor_id_thread;
 }
 
-message_t get_message(actor_t* actor_ptr) {
+static message_t get_message(actor_t* actor_ptr) {
     lock(&actor_ptr->actor_mutex);
     message_t message = actor_ptr->message_queue.messages[actor_ptr->message_queue.first_index];
     actor_ptr->message_queue.first_index =
@@ -256,7 +293,32 @@ message_t get_message(actor_t* actor_ptr) {
     return message;
 }
 
-void handle_godie(actor_t* actor_ptr) {
+static void check_fully_dead(actor_t* actor_ptr) {
+    bool count = false;
+
+    lock(&actor_ptr->actor_mutex);
+
+    if (!actor_ptr->counted_as_dead && actor_ptr->is_dead &&
+        actor_ptr->message_queue.first_index == actor_ptr->message_queue.second_index) {
+        actor_ptr->counted_as_dead = true;
+        count = true;
+    }
+
+    unlock(&actor_ptr->actor_mutex);
+
+    if (count) {
+        lock(&actor_system_data.variables_mutex);
+
+        if (actor_system_data.dead_actors == -2) {
+            actor_system_data.dead_actors = 0;
+        }
+        actor_system_data.dead_actors++;
+
+        unlock(&actor_system_data.variables_mutex);
+    }
+}
+
+static inline void handle_godie(actor_t* actor_ptr) {
     lock(&actor_ptr->actor_mutex);
 
     actor_ptr->is_dead = true;
@@ -264,21 +326,25 @@ void handle_godie(actor_t* actor_ptr) {
     unlock(&actor_ptr->actor_mutex);
 }
 
-void handle_spawn(actor_t* actor_ptr, message_t message) {
+static void handle_spawn(actor_t* actor_ptr, message_t message) {
     role_t* role = (role_t*) message.data;
 
     actor_t* new_actor = create_actor(role);
+    if (!new_actor) {
+        return;
+    }
+
     message_t new_message;
 
     new_message.message_type = MSG_HELLO;
-    new_message.data = (void*) actor_ptr->actor_id; //todo address or value?;
+    new_message.data = (void*) actor_ptr->actor_id;
     new_message.nbytes = sizeof(actor_id_t);
 
     send_message(new_actor->actor_id, new_message);
 }
 
-void handle_actor(actor_t* actor_ptr) {
-    pthread_setspecific(actor_id_key, &actor_ptr->actor_id);
+static void handle_actor(actor_t* actor_ptr) {
+    actor_id_thread = actor_ptr->actor_id; // Can access without actor mutex
 
     message_t message = get_message(actor_ptr);
 
@@ -289,77 +355,92 @@ void handle_actor(actor_t* actor_ptr) {
     } else {
         role_t* role = actor_ptr->role;
         act_t* prompts = role->prompts;
-        prompts[message.message_type](actor_ptr->stateptr, message.nbytes, message.data);
-
+        prompts[message.message_type](&actor_ptr->stateptr, message.nbytes, message.data);
     }
-
-
 }
 
-void* thread_run() {
+static actor_t* get_actor() { // We have locked global mutex here
+    actor_id_t first_actor_index = actor_system_data.actors_with_messages.first_index;
+    actor_id_t actor_id = actor_system_data.actors_with_messages.actors[first_actor_index];
+    actor_t* actor_to_handle = actor_system_data.actors[actor_id];
+
+    actor_system_data.actors_with_messages.first_index =
+            (1 + actor_system_data.actors_with_messages.first_index) %
+            actor_system_data.actors_with_messages.max_size;
+
+    return actor_to_handle;
+}
+
+static void* thread_run() {
     int err;
 
     while (system_alive()) {
 
         lock(&actor_system_data.variables_mutex);
 
-        while (!actor_system_data.messages_to_handle) { // Waits until there are messages for actors
+        while (actor_system_data.actors_with_messages.first_index ==
+               actor_system_data.actors_with_messages.second_index) { // Waits until there are messages for actors
             if ((err = pthread_cond_wait(&actor_system_data.waiting_threads,
                                          &actor_system_data.variables_mutex)) != 0) {
-                syserr(err, "Cond wait failed");
+                exit(1); // todo change tp syserr
             }
             if (actor_system_data.how_many_actors == actor_system_data.dead_actors) {
+                if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
+                    // If system is dead we wake up others thread, so they can finish
+                    exit(1); // todo change tp syserr
+                }
+                unlock(&actor_system_data.variables_mutex);
                 return NULL;
             }
         }
-        actor_id_t first_actor_index = actor_system_data.actors_with_messages.first_index;
-        actor_t* actor_to_handle = actor_system_data.actors_with_messages.actors[first_actor_index];
 
-        actor_system_data.actors_with_messages.first_index =
-                (1 + actor_system_data.actors_with_messages.first_index) %
-                actor_system_data.actors_with_messages.max_size;
 
-        actor_system_data.messages_to_handle = actor_system_data.actors_with_messages.first_index !=
-                                               actor_system_data.actors_with_messages.second_index;
+        actor_t* actor_to_handle = get_actor();
 
         unlock(&actor_system_data.variables_mutex);
+
+        lock(&actor_to_handle->actor_mutex);
+        actor_to_handle->is_being_handled = true;
+        actor_to_handle->is_in_queue = false;
+        unlock(&actor_to_handle->actor_mutex);
 
         handle_actor(actor_to_handle);
 
-        lock(&actor_system_data.variables_mutex);
         lock(&actor_to_handle->actor_mutex);
-
-        if (actor_to_handle->message_queue.first_index != actor_to_handle->message_queue.second_index) {
-            add_actor_to_queue(&actor_system_data.actors_with_messages, actor_to_handle);
-            actor_system_data.messages_to_handle = true;
-        } else if (actor_to_handle->is_dead) {
-            if (actor_system_data.dead_actors == -1) {
-                actor_system_data.dead_actors = 0;
-            }
-            actor_system_data.dead_actors++;
-        }
-
+        bool actor_has_messages =
+                actor_to_handle->message_queue.first_index != actor_to_handle->message_queue.second_index;
+        bool is_dead = actor_to_handle->is_dead;
+        actor_to_handle->is_being_handled = false;
         unlock(&actor_to_handle->actor_mutex);
-        unlock(&actor_system_data.variables_mutex);
 
+        if (actor_has_messages) {
+            add_actor_to_queue(&actor_system_data.actors_with_messages, actor_to_handle);
+        } else if (is_dead) {
+            check_fully_dead(actor_to_handle);
+        }
     }
 
-    return NULL; // TODO good function type?
+    if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
+        // If system is dead we wake up others thread, so they can finish
+        exit(1);
+    }
+
+    return NULL;
 }
 
-int initialize_queue(actor_queue_t* queue) {
+static int initialize_queue(actor_queue_t* queue) {
     queue->first_index = 0;
     queue->second_index = 0;
     queue->max_size = INITIAL_ACTOR_QUEUE_LIMIT;
-    queue->actors = malloc(sizeof(actor_t*) * INITIAL_ACTOR_QUEUE_LIMIT);
+    queue->actors = malloc(sizeof(actor_id_t) * INITIAL_ACTOR_QUEUE_LIMIT);
     if (!queue->actors) {
         return -1;
     }
     return 0;
 }
 
-int initialize_system_data() {
-    actor_system_data.messages_to_handle = false;
+static int initialize_system_data() {
+    actor_system_data.can_create_new_actors = true;
     actor_system_data.how_many_actors = 0;
     actor_system_data.dead_actors = -2;
 
@@ -372,62 +453,136 @@ int initialize_system_data() {
     return initialize_queue(&actor_system_data.actors_with_messages);
 }
 
+static void handle_sigint() {
+    lock(&actor_system_data.variables_mutex); // Safe, no other thread can enter this function with locked mutex
+    actor_system_data.can_create_new_actors = false;
+    actor_id_t num_of_actors = actor_system_data.how_many_actors;
+    unlock(&actor_system_data.variables_mutex);
+
+    // No new actors are created, we can safely access this array
+    for (actor_id_t actor = 1; actor <= num_of_actors; ++actor) {
+        actor_t* actor_ptr = actor_system_data.actors[actor];
+        lock(&actor_ptr->actor_mutex);
+        actor_ptr->is_dead = true;
+        unlock(&actor_ptr->actor_mutex);
+
+        check_fully_dead(actor_ptr);
+    }
+    int err;
+    if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
+        // If system is dead we wake up others thread, so they can finish
+        exit(1); // todo change tp syserr
+    }
+}
+
+static void* signal_handler() {
+    sigset_t sigint_mask;
+    sigemptyset(&sigint_mask);
+    sigaddset(&sigint_mask, SIGINT);
+
+    int signal;
+    sigwait(&sigint_mask, &signal);
+    handle_sigint();
+
+    return NULL;
+}
+
+static int make_signal_handler() {
+    sigset_t block_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGINT);
+
+    if (pthread_sigmask(SIG_BLOCK, &block_mask, NULL) != 0) {
+        // Blocks SIGINT for all threads
+        return -1;
+    }
+
+    pthread_t signal_thread;
+    if (pthread_create(&signal_thread, NULL, signal_handler, NULL) != 0) {
+        return -1;
+    }
+    actor_system_data.signal_handler = signal_thread;
+
+    return 0;
+}
+
+static void cleanup_memory() { // We have locked variable mutex here
+    for (actor_id_t actor = 1; actor <= actor_system_data.how_many_actors; ++actor) {
+        actor_t* actor_ptr = actor_system_data.actors[actor];
+        free(actor_ptr->message_queue.messages);
+        pthread_mutex_destroy(&actor_ptr->actor_mutex);
+        free(actor_ptr);
+    }
+    free(actor_system_data.actors);
+    free(actor_system_data.actors_with_messages.actors);
+}
+
 int actor_system_create(actor_id_t* actor, role_t* const role) {
-    // todo new thread fo handling signals
-    /*
-     * czyli chyba trzeba najpierw zrobić ten 1 wątek do sygnałów bez zmieniania maski
-        potem zmienić maskę sygnałów
-        a potem zrobić POOL_SIZE wątków z nową maską
-        poza tym, pytania na moodlu są do północy
-        więc jak mamy jakieś, to trzeba je zadawać asap
-        It is possible to create a new thread with a specific signal mask without using these functions. On the thread that calls pthread_create, the required steps for the general case are:
-        Mask all signals, and save the old signal mask, using pthread_sigmask. This ensures that the new thread will be created with all signals masked, so that no signals can be delivered to the thread until the desired signal mask is set.
-        Call pthread_create to create the new thread, passing the desired signal mask to the thread start routine (which could be a wrapper function for the actual thread start routine). It may be necessary to make a copy of the desired signal mask on the heap, so that the life-time of the copy extends to the point when the start routine needs to access the signal mask.
-        Restore the thread’s signal mask, to the set that was saved in the first step
-     */
-
-
-    pthread_key_create(&actor_id_key, NULL);
-
-    if (pthread_cond_init(&actor_system_data.waiting_threads, 0) != 0) {
+    if (make_signal_handler() < 0) {
         return -1;
     }
 
-    if (pthread_mutex_init(&actor_system_data.variables_mutex, 0) != 0) {
-        return -1;
-    }
-
-    if (initialize_system_data() < 1) {
-        // todo cleanup memory
+    if (initialize_system_data() < 0) {
+        cleanup_memory();
         return -1;
     }
 
     for (int i = 0; i <= POOL_SIZE - 1; ++i) {
-//        pthread_attr_t attr; // todo necessary?
         if (pthread_create(&actor_system_data.thread_array[i], NULL, thread_run, NULL) != 0) {
-            return -1; // todo memory cleanup
+            cleanup_memory();
+            return -1;
         }
     }
+
     actor_t* first_actor = create_actor(role);
-    actor = &first_actor->actor_id;
+    *actor = first_actor->actor_id;
 
     message_t new_message;
     new_message.message_type = MSG_HELLO;
     new_message.data = NULL;
     new_message.nbytes = sizeof(actor_id_t);
-    send_message(*actor, new_message);
+    send_message(*actor, new_message); // Should always succeed
 
     return 0;
 }
 
 void actor_system_join(actor_id_t actor) {
+    if (!system_alive()) {
+        return;
+    }
+
+    lock(&actor_system_data.variables_mutex); // Static mutex, can be accessed anytime
+
+    if (actor > actor_system_data.how_many_actors || actor < 1) {
+        unlock(&actor_system_data.variables_mutex);
+        return;
+    }
+
+    unlock(&actor_system_data.variables_mutex);
+
+    void* return_value;
+    int err;
+    for (int i = 0; i < POOL_SIZE; ++i) {
+        if ((err = pthread_join(actor_system_data.thread_array[i], &return_value)) != 0) {
+            exit(1); // todo change tp syserr
+        }
+    }
+
     lock(&actor_system_data.variables_mutex);
+    cleanup_memory();
+    actor_system_data.how_many_actors = 0;
+    actor_system_data.dead_actors = 0;
+    unlock(&actor_system_data.variables_mutex);
 
+    pthread_cancel(actor_system_data.signal_handler); // May return error value, but we can't deal with it
 
+    if ((err = pthread_join(actor_system_data.signal_handler, &return_value)) != 0) {
+        exit(1); // todo change tp syserr
+    }
 
+    sigset_t unblock_sigint;
+    sigemptyset(&unblock_sigint);
+    sigaddset(&unblock_sigint, SIGINT);
 
-
-    //todo cleanup memory
-
-
+    pthread_sigmask(SIG_UNBLOCK, &unblock_sigint, NULL); // May return error value, but we can't deal with it
 }
