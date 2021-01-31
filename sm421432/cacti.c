@@ -94,8 +94,7 @@ static int resize_message_queue(message_queue_t* message_queue) {
         exit(1); // Queue is invalid
     }
 
-
-    // todo does not work if new_size < 2 * old_size
+    
     if (message_queue->first_index > message_queue->second_index) {
         for (int i = 0; i < message_queue->first_index; ++i) {
             message_queue->messages[i + old_size] = message_queue->messages[i];
