@@ -69,7 +69,7 @@ actor_system_t actor_system_data = { // Global data structure for actor system
         .dead_actors = 0
 };
 
-actor_id_t _Thread_local actor_id_thread; // Thread specific variable with id of actor being handled
+_Thread_local actor_id_t actor_id_thread; // Thread specific variable with id of actor being handled
 
 static inline void lock(pthread_mutex_t* mutex) {
     int err;
