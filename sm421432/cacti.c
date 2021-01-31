@@ -1,18 +1,10 @@
 #include <pthread.h>
-#include <semaphore.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <signal.h>
-#include <errno.h>
-#include <unistd.h>
 
-// TODO Optimize includes
-
-
+#include "err.h"
 #include "cacti.h"
 
 #define INITIAL_MESSAGE_QUEUE_LIMIT 1024
@@ -74,14 +66,14 @@ _Thread_local actor_id_t actor_id_thread; // Thread specific variable with id of
 static inline void lock(pthread_mutex_t* mutex) {
     int err;
     if ((err = pthread_mutex_lock(mutex)) != 0) {
-        exit(1); // todo change tp syserr
+        syserr(err, "Mutex lock error");
     }
 }
 
 static inline void unlock(pthread_mutex_t* mutex) {
     int err;
     if ((err = pthread_mutex_unlock(mutex)) != 0) {
-        exit(1); // todo change tp syserr
+        syserr(err, "Mutex unlock error");
     }
 }
 
@@ -99,8 +91,7 @@ static int resize_message_queue(message_queue_t* message_queue) {
 
     message_queue->messages = realloc(message_queue->messages, message_queue->max_size);
     if (!message_queue->messages) {
-        printf("Memory error"); // todo handle
-        return -1;
+        exit(1); // Queue is invalid
     }
 
 
@@ -119,8 +110,7 @@ static void resize_actor_queue(actor_queue_t* actor_queue) {
     actor_queue->max_size = actor_queue->max_size * 2;
     actor_queue->actors = realloc(actor_queue->actors, actor_queue->max_size);
     if (!actor_queue->actors) {
-        printf("Memory error"); // todo change tp syserr
-        return;
+        exit(1); // Queue is invalid
     }
 
     if (actor_queue->first_index > actor_queue->second_index) {
@@ -152,9 +142,10 @@ static void add_actor_to_queue(actor_queue_t* actor_queue, actor_t* actor_ptr) {
     actor_queue->second_index = (actor_queue->second_index + 1) % actor_queue->max_size;
 
 
+    int err;
     // Wake up a thread that can handle the new message
-    if (pthread_cond_signal(&actor_system_data.waiting_threads) != 0) {
-        exit(1); // todo change tp syserr
+    if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
+        syserr(err, "Conditional signal error");
     }
     unlock(&actor_system_data.variables_mutex);
 }
@@ -223,12 +214,12 @@ static void resize_actor_array() {
     }
     actor_system_data.actors = realloc(actor_system_data.actors, actor_system_data.actor_array_size);
     if (!actor_system_data.actors) {
-        printf("Memory error"); // todo change tp syserr
-        return;
+        exit(1); // Array is invalid
     }
 
 }
 
+// Returns NULL if creating actor failed (memory allocation error, cond initialization error, too many actors)
 static actor_t* create_actor(role_t* role) {
     lock(&actor_system_data.variables_mutex);
 
@@ -238,7 +229,7 @@ static actor_t* create_actor(role_t* role) {
     }
 
     if (actor_system_data.how_many_actors + 1 > CAST_LIMIT) {
-        //todo too many actors
+        return NULL;
     }
     if (actor_system_data.how_many_actors + 1 == actor_system_data.actor_array_size) {
         resize_actor_array();
@@ -246,16 +237,16 @@ static actor_t* create_actor(role_t* role) {
 
     actor_t* actor = malloc(sizeof(actor_t));
     if (!actor) {
-        // todo syserr
+        return NULL;
     }
 
     actor->message_queue.messages = malloc(sizeof(message_t) * INITIAL_MESSAGE_QUEUE_LIMIT);
     if (actor->message_queue.messages == NULL) {
-        // todo syserr
+        return NULL;
     }
 
     if (pthread_mutex_init(&actor->actor_mutex, 0) != 0) {
-        // todo syserr
+        return NULL;
     }
 
     actor->message_queue.first_index = 0;
@@ -382,12 +373,12 @@ static void* thread_run() {
                actor_system_data.actors_with_messages.second_index) { // Waits until there are messages for actors
             if ((err = pthread_cond_wait(&actor_system_data.waiting_threads,
                                          &actor_system_data.variables_mutex)) != 0) {
-                exit(1); // todo change tp syserr
+                syserr(err, "Conditional wait error");
             }
             if (actor_system_data.how_many_actors == actor_system_data.dead_actors) {
                 if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
                     // If system is dead we wake up others thread, so they can finish
-                    exit(1); // todo change tp syserr
+                    syserr(err, "Conditional signal error");
                 }
                 unlock(&actor_system_data.variables_mutex);
                 return NULL;
@@ -422,7 +413,7 @@ static void* thread_run() {
 
     if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
         // If system is dead we wake up others thread, so they can finish
-        exit(1);
+        syserr(err, "Conditional signal error");
     }
 
     return NULL;
@@ -471,7 +462,7 @@ static void handle_sigint() {
     int err;
     if ((err = pthread_cond_signal(&actor_system_data.waiting_threads)) != 0) {
         // If system is dead we wake up others thread, so they can finish
-        exit(1); // todo change tp syserr
+        syserr(err, "Conditional signal error");
     }
 }
 
@@ -535,6 +526,10 @@ int actor_system_create(actor_id_t* actor, role_t* const role) {
     }
 
     actor_t* first_actor = create_actor(role);
+    if (!first_actor) {
+        return -1;
+    }
+
     *actor = first_actor->actor_id;
 
     message_t new_message;
@@ -564,7 +559,7 @@ void actor_system_join(actor_id_t actor) {
     int err;
     for (int i = 0; i < POOL_SIZE; ++i) {
         if ((err = pthread_join(actor_system_data.thread_array[i], &return_value)) != 0) {
-            exit(1); // todo change tp syserr
+            syserr(err, "Join error");
         }
     }
 
@@ -577,7 +572,7 @@ void actor_system_join(actor_id_t actor) {
     pthread_cancel(actor_system_data.signal_handler); // May return error value, but we can't deal with it
 
     if ((err = pthread_join(actor_system_data.signal_handler, &return_value)) != 0) {
-        exit(1); // todo change tp syserr
+        syserr(err, "Join error");
     }
 
     sigset_t unblock_sigint;

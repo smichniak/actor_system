@@ -3,7 +3,6 @@
  * na Uniwersytecie Warszawskim w roku akademickim 2020/2021.
  */
 
-// todo only allowed includes
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

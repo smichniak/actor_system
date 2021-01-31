@@ -92,9 +92,8 @@ void get_data(void** stateptr, size_t nbytes, void* data) {
 int main() {
     actor_id_t first_id;
     int n;
-//
+
     scanf("%d", &n);
-//    printf("%d\n", n);
 
     factorial_t factorial_data;
     factorial_data.current_product = 1;
