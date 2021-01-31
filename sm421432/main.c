@@ -77,6 +77,7 @@ int main() {
     printf("%d\n", actor_system_create(&first_id, &r1));
     printf("Second system, First id: %ld\n", first_id);
 
+    actor_system_join(1);
 
     printf("XD\n");
     return 0;
