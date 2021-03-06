@@ -1,5 +1,5 @@
 # Actor_system
-Pierwsze duże zadanie zaliczeniowe z przedmiotu [Programowanie współbieżne](https://usosweb.mimuw.edu.pl/kontroler.php?_action=katalog2/przedmioty/pokazPrzedmiot&kod=1000-213bPW) w roku akademickim 2020/21 na wydziale MIM UW.
+Drugie duże zadanie zaliczeniowe z przedmiotu [Programowanie współbieżne](https://usosweb.mimuw.edu.pl/kontroler.php?_action=katalog2/przedmioty/pokazPrzedmiot&kod=1000-213bPW) w roku akademickim 2020/21 na wydziale MIM UW.
 
 ## Wprowadzenie
 
